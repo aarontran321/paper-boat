@@ -30,11 +30,11 @@
 <h1 class="ui">Paper Boat<small>a small thing on a big sea</small></h1>
 <div class="panel ui">
   <label for="sun">Sun</label><input id="sun" type="range" min="2" max="65" step="0.1" value="9">
-  <label for="sea">Swell</label><input id="sea" type="range" min="0.2" max="2.6" step="0.01" value="1.15">
+  <label for="sea">Swell</label><input id="sea" type="range" min="0.2" max="2.6" step="0.01" value="1.0">
   <label for="cloud">Clouds</label><input id="cloud" type="range" min="0" max="1" step="0.01" value="0.32">
-  <div class="btns"><button id="dip" aria-pressed="false">Dip the lens</button><button id="hide">Hide UI</button></div>
+  <div class="btns"><button id="dip" aria-pressed="false">Dip the lens</button><button id="reseed">New sea</button><button id="hide">Hide UI</button></div>
 </div>
-<div class="hint ui">drag to look around · drag up/down to raise or sink the camera<br>scroll to zoom · click the water to make ripples · tap the boat</div>
+<div class="hint ui"><b>WASD / arrow keys to sail</b><br>drag to look around · drag up/down to raise or sink the camera<br>scroll to zoom · click the water to make ripples · tap the boat</div>
 <div class="err" id="err">This scene needs WebGL2.</div>
 
 <script id="fs" type="x-shader/x-fragment">#version 300 es
@@ -45,7 +45,8 @@ uniform float uT, uAmp, uWind, uLens, uBoatOn, uCloud, uExpo;
 uniform vec3 uCam, uF, uR, uU, uSun, uSunC, uLr, uBoatP;
 uniform vec2 uBoatYaw;
 uniform vec4 uRip[4];
-uniform float uRipOn;
+uniform float uRipOn, uSeed, uWakeOn, uBoatSpd;
+uniform vec4 uWake[20];
 uniform vec3 uTri[42];
 uniform vec4 uBS;
 
@@ -75,27 +76,55 @@ float ripples(vec2 p){
   }
   return h;
 }
+// wave groups: three slow, crossing modulations travelling at roughly group speed.
+// Where they line up, a set of big waves rolls through; elsewhere the sea goes quiet.
+float groupEnv(vec2 p){
+  float m1=.5+.5*sin(dot(vec2(cos(uWind),sin(uWind)),p)*.045-uT*.13+uSeed);
+  float m2=.5+.5*sin(dot(vec2(cos(uWind+.9),sin(uWind+.9)),p)*.032-uT*.10+uSeed*1.7);
+  float m3=.5+.5*sin(dot(vec2(cos(uWind-.7),sin(uWind-.7)),p)*.058-uT*.15+uSeed*2.3);
+  return .35+2.6*m1*m2*(.4+.6*m3);
+}
 // sum of sharp-crested travelling waves; each one drags the domain of the next,
 // which bunches small ripples onto the crests of the big ones
 float waves(vec2 p,int n){
-  float f=F0, a=1., s=0., ws=0.;
+  float env=groupEnv(p);
+  float f=F0, a=1., s=0.;
   for(int i=0;i<NN;i++){
     if(i>=n) break;
     float fi=float(i);
-    float ang=uWind+sin(fi*2.39996)*1.2;
+    float g=i<6?env:1.+(env-1.)*.3;
+    float ang=uWind+sin(fi*2.39996+uSeed)*1.2;
     vec2 d=vec2(cos(ang),sin(ang));
-    float x=dot(d,p)*f+uT*sqrt(9.81*f)*.8+fi*1.7;   // deep-water dispersion
+    float x=dot(d,p)*f+uT*sqrt(9.81*f)*.8+fi*1.7+uSeed*fi*.37;   // deep-water dispersion
     float w=exp(sin(x)-1.);
-    s+=w*a; ws+=a;
-    p-=d*(w*cos(x)*a*.3/F0);
+    s+=(w-.466)*a*g;
+    p-=d*(w*cos(x)*a*min(g,1.4)*.3/F0);
     f*=1.19; a*=.8;
   }
-  return ((s+.466*(WT-ws))/WT-.466)*uAmp;
+  return s/WT*uAmp;
 }
 float H(vec2 p,int n){ return waves(p,n)+ripples(p); }
 vec3 normalAt(vec2 p,float t,int n){
   float e=.004+t*.0012; float h=H(p,n);
   return normalize(vec3(h-H(p+vec2(e,0),n), e, h-H(p+vec2(0,e),n)));
+}
+
+// rings shed by the moving hull; their overlap forms the V-shaped wake
+float wakeH(vec2 p,out float foam){
+  foam=0.; if(uWakeOn<.5) return 0.;
+  float h=0.;
+  for(int i=0;i<20;i++){
+    vec4 w=uWake[i]; if(w.w<=0.) continue;
+    float age=uT-w.z; if(age<0.||age>4.) continue;
+    vec2 q=p-w.xy; float r2=dot(q,q);
+    float front=.2+age*1.05;
+    if(r2>(front+1.2)*(front+1.2)) continue;
+    float r=sqrt(r2), x=r-front;
+    float A=w.w*exp(-age*.6);
+    h+=A*.03*sin(x*9.)*exp(-x*x*6.)/(1.+r*.8);
+    foam+=A*(exp(-x*x*60.)*.12*exp(-age*1.6)+exp(-r2*4.)*.8*exp(-age*.9));
+  }
+  return h;
 }
 
 // ---------- the boat (14 triangles, ray traced) ----------
@@ -205,7 +234,8 @@ vec3 paperShade(vec3 p,vec3 n,vec3 rd){
   if(p.y<wl) sh*=.6;
   float dif=max(dot(n,uSun),0.)*sh;
   float trn=max(-dot(n,uSun),0.);                       // sunlight glowing through the paper
-  vec3 amb=mix(vec3(.06,.07,.08),skyBase(vec3(0,1,0))*.45,n.y*.5+.5);
+  vec3 sk=skyBase(vec3(0,1,0)); sk=mix(vec3(dot(sk,vec3(.3,.5,.2))),sk,.35);
+  vec3 amb=mix(vec3(.06,.07,.08),sk*.42,n.y*.5+.5);
   vec3 bounce=vec3(.03,.10,.11)*max(-n.y,0.)*(.5+uSun.y); // light off the sea
   vec3 c=alb*(uSunC*(dif*.85+trn*.40*vec3(1.,.82,.55)*(1.-wet*.4))+amb+bounce);
   vec3 h=normalize(uSun-rd);
@@ -216,7 +246,7 @@ vec3 paperShade(vec3 p,vec3 n,vec3 rd){
 // ---------- tracing ----------
 // coarse march to bracket the first crossing, then a few secant steps
 float traceAir(vec3 ro,vec3 rd){
-  float top=uAmp*.5+.15;
+  float top=uAmp*1.05+.2;
   float t=0.;
   if(ro.y>top){ if(rd.y>=-1e-4) return -1.; t=(ro.y-top)/-rd.y; }
   float tPrev=t; vec3 p=ro+rd*t; float d=p.y-H(p.xz,NG), dPrev=d;
@@ -259,6 +289,11 @@ float traceUnder(vec3 ro,vec3 rd){
 vec3 waterAbove(vec3 rd,float t,vec3 p){
   int nn=int(mix(28.,10.,smoothstep(3.,90.,t)));
   vec3 N=normalAt(p.xz,t,nn);
+  float wf=0.;
+  if(t<45.&&uWakeOn>.5){
+    float e=.03, f1, f2; float w0=wakeH(p.xz,wf), wx=wakeH(p.xz+vec2(e,0),f1), wz=wakeH(p.xz+vec2(0,e),f2);
+    N=normalize(N+vec3(w0-wx,0.,w0-wz)/e);
+  }
   N=normalize(mix(N,vec3(0,1,0),smoothstep(60.,400.,t)*.7));
   float nv=max(dot(N,-rd),0.);
   float F=.02+.98*pow(1.-nv,5.);
@@ -292,10 +327,11 @@ vec3 waterAbove(vec3 rd,float t,vec3 p){
   // foam: whitecaps and the boat's waterline
   float hd=near?hullDist(p):9.;
   float fn=fbm(p.xz*3.+vec2(uT*.25,uT*.1),4);
-  float crestF=smoothstep(.34*uAmp,.52*uAmp,p.y+fn*.14*uAmp);
-  float hullF=exp(-max(hd,0.)*12.)*step(-.03,hd)*step(hd,8.);
-  float fm=clamp(crestF*.7+hullF,0.,1.)*smoothstep(.3,.62,fn+hullF*.25);
-  vec3 fc=uSunC*(.22+.6*max(dot(N,uSun),0.))*shadow+skyBase(vec3(0,1,0))*.6;
+  float crestF=smoothstep(.45*uAmp,.75*uAmp,p.y+fn*.14*uAmp);
+  float hullF=exp(-max(hd,0.)*mix(12.,4.5,clamp(uBoatSpd,0.,1.)))*step(-.03,hd)*step(hd,8.)*(1.+uBoatSpd*.8);
+  float fm=clamp(crestF*.7+hullF+wf*.9,0.,1.)*smoothstep(.3,.62,fn+(hullF+wf)*.25);
+  vec3 skA=skyBase(vec3(0,1,0)); skA=mix(vec3(dot(skA,vec3(.3,.5,.2))),skA,.4);
+  vec3 fc=uSunC*(.22+.6*max(dot(N,uSun),0.))*mix(.3,1.,shadow)+skA*.5;
   col=mix(col,fc*.82,fm*(1.-smoothstep(25.,90.,t)));
   if(hd<8.) col*=1.-.22*exp(-max(hd,0.)*9.);
   // distance haze
@@ -398,25 +434,32 @@ gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STAT
 const loc = gl.getAttribLocation(prog, 'a');
 gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 const U = {};
-['uRipOn','uRes','uT','uAmp','uWind','uLens','uBoatOn','uCloud','uExpo','uCam','uF','uR','uU','uSun','uSunC','uLr','uBoatP','uBoatYaw','uRip','uTri','uBS']
+['uSeed','uWakeOn','uBoatSpd','uWake','uRipOn','uRes','uT','uAmp','uWind','uLens','uBoatOn','uCloud','uExpo','uCam','uF','uR','uU','uSun','uSunC','uLr','uBoatP','uBoatYaw','uRip','uTri','uBS']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ---------- shared sea model (must match the shader) ----------
 const F0 = 0.38, WT = 4.99604, NG = 9;
-const sea = { amp: 1.15, wind: 0.6, cloud: 0.32 };
+const sea = { amp: 1.0, wind: 0.6, cloud: 0.32, seed: Math.random() * 6.2832 };
 const rip = [[0,0,-99,0],[0,0,-99,0],[0,0,-99,0],[0,0,-99,0]]; let ripI = 0;
 const smooth = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+function groupEnv(x, z, t) {
+  const W = sea.wind, S = sea.seed;
+  const m = (ang, k, w, ph) => 0.5 + 0.5 * Math.sin((Math.cos(ang) * x + Math.sin(ang) * z) * k - t * w + ph);
+  return 0.35 + 2.6 * m(W, 0.045, 0.13, S) * m(W + 0.9, 0.032, 0.10, S * 1.7) * (0.4 + 0.6 * m(W - 0.7, 0.058, 0.15, S * 2.3));
+}
 function waves(x, z, t, n) {
-  let f = F0, a = 1, s = 0, ws = 0;
+  const env = groupEnv(x, z, t);
+  let f = F0, a = 1, s = 0;
   for (let i = 0; i < n; i++) {
-    const ang = sea.wind + Math.sin(i * 2.39996) * 1.2, dx = Math.cos(ang), dz = Math.sin(ang);
-    const xx = (dx * x + dz * z) * f + t * Math.sqrt(9.81 * f) * 0.8 + i * 1.7;
+    const g = i < 6 ? env : 1 + (env - 1) * 0.3;
+    const ang = sea.wind + Math.sin(i * 2.39996 + sea.seed) * 1.2, dx = Math.cos(ang), dz = Math.sin(ang);
+    const xx = (dx * x + dz * z) * f + t * Math.sqrt(9.81 * f) * 0.8 + i * 1.7 + sea.seed * i * 0.37;
     const w = Math.exp(Math.sin(xx) - 1);
-    s += w * a; ws += a;
-    const k = w * Math.cos(xx) * a * 0.3 / F0; x -= dx * k; z -= dz * k;
+    s += (w - 0.466) * a * g;
+    const k = w * Math.cos(xx) * a * Math.min(g, 1.4) * 0.3 / F0; x -= dx * k; z -= dz * k;
     f *= 1.19; a *= 0.8;
   }
-  return ((s + 0.466 * (WT - ws)) / WT - 0.466) * sea.amp;
+  return s / WT * sea.amp;
 }
 function ripples(x, z, t) {
   let h = 0;
@@ -448,7 +491,25 @@ const TRIS = [
 const DRAFT = 0.1;
 const triData = new Float32Array(TRIS.length * 9);
 
-const boat = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, pitch: 0, pv: 0, roll: 0, rv: 0, yaw: 0.4, yv: 0, poke: 0 };
+const keys = {};
+const key = (a, b) => !!(keys[a] || keys[b]);
+const driving = () => key('w', 'arrowup') || key('s', 'arrowdown') || key('a', 'arrowleft') || key('d', 'arrowright');
+const STEER = ['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'];
+addEventListener('keydown', e => { const k = e.key.toLowerCase(); if (STEER.includes(k)) { keys[k] = true; e.preventDefault(); } });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+// wake: the hull sheds a ring every 0.14 s while it moves
+const wake = new Float32Array(80); let wakeI = 0, wakeTimer = 0;
+function wakeStep(dt) {
+  wakeTimer += dt;
+  if (wakeTimer < 0.14) return;
+  wakeTimer = 0;
+  if (boat.spd < 0.12) return;
+  wake.set([boat.x, boat.z, T, Math.min(boat.spd / 2.5, 1.2)], wakeI * 4); wakeI = (wakeI + 1) % 20;
+}
+
+const boat = { spd: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, pitch: 0, pv: 0, roll: 0, rv: 0, yaw: 0.4, yv: 0, poke: 0 };
 function boatStep(t, dt) {
   const c = Math.cos(boat.yaw), s = Math.sin(boat.yaw);
   const w = (lx, lz) => H(boat.x + lx * c + lz * s, boat.z - lx * s + lz * c, t);
@@ -460,16 +521,25 @@ function boatStep(t, dt) {
   const pT = Math.atan2(hb - hs, 1.24), rT = Math.atan2(hst - hp, 0.32) * 0.55;
   boat.pv += (38 * (pT - boat.pitch) - 5.5 * boat.pv) * dt; boat.pitch += boat.pv * dt;
   boat.rv += (30 * (rT - boat.roll) - 3.2 * boat.rv) * dt; boat.roll += boat.rv * dt;
-  // slide down wave faces, a little wind drift, a soft tether so it stays in view
+  // slide down wave faces, drift with the wind, and push from the keyboard
   const gF = (hb - hs) / 1.24, gP = (hp - hst) / 0.32;
   const gx = gF * c + gP * s, gz = -gF * s + gP * c;
   const wx = Math.cos(sea.wind), wz = Math.sin(sea.wind);
-  boat.vx += (-gx * 1.1 + wx * 0.05 - boat.x * 0.02 - boat.vx * 0.7) * dt;
-  boat.vz += (-gz * 1.1 + wz * 0.05 - boat.z * 0.02 - boat.vz * 0.7) * dt;
+  const bx = c, bz = -s, px = s, pz = c;                       // bow and port directions
+  const vf = boat.vx * bx + boat.vz * bz, vs = boat.vx * px + boat.vz * pz;
+  const thrust = (key('w', 'arrowup') ? 2.8 : 0) - (key('s', 'arrowdown') ? 1.4 : 0);
+  const turn = (key('a', 'arrowleft') ? 1 : 0) - (key('d', 'arrowright') ? 1 : 0);
+  // the keel resists sideways motion far more than forward motion
+  const dragX = bx * vf * 0.55 + px * vs * 2.6, dragZ = bz * vf * 0.55 + pz * vs * 2.6;
+  boat.vx += (-gx * 1.1 + wx * 0.05 + bx * thrust - dragX) * dt;
+  boat.vz += (-gz * 1.1 + wz * 0.05 + bz * thrust - dragZ) * dt;
   boat.x += boat.vx * dt; boat.z += boat.vz * dt;
-  // lazy turning
-  boat.yv += (0.18 * Math.sin(t * 0.11) + 0.4 * gP * 0.2 - 1.1 * boat.yv) * dt;
+  boat.spd = Math.hypot(boat.vx, boat.vz);
+  // turning: from the keys when steering, otherwise a lazy drift
+  const steer = turn * 1.7 * (0.45 + Math.min(Math.abs(vf), 2.5) * 0.35);
+  boat.yv += ((driving() ? steer : 0.18 * Math.sin(t * 0.11)) + 0.08 * gP - 1.6 * boat.yv) * dt;
   boat.yaw += boat.yv * dt;
+  boat.rv += (-boat.yv * vf * 0.5) * dt;                       // lean in the turn
 }
 function boatUpload() {
   const cy = Math.cos(boat.yaw), sy = Math.sin(boat.yaw), cp = Math.cos(boat.pitch), sp = Math.sin(boat.pitch);
@@ -511,6 +581,7 @@ const cam = { yaw: sunAz + Math.PI + 0.42, dist: 5.6, h: 0.95, hT: 0.95, distT: 
 const dipBtn = document.getElementById('dip');
 function setDip(on) { dipBtn.setAttribute('aria-pressed', on); cam.hT = on ? 0.02 : 0.95; }
 dipBtn.onclick = () => setDip(dipBtn.getAttribute('aria-pressed') !== 'true');
+document.getElementById('reseed').onclick = () => { sea.seed = Math.random() * 6.2832; };
 document.getElementById('hide').onclick = () => document.body.classList.toggle('hidden');
 addEventListener('keydown', e => { if (e.key === 'h' || e.key === 'H') document.body.classList.toggle('hidden'); });
 document.getElementById('sun').oninput = e => sunEl = e.target.value * Math.PI / 180;
@@ -522,9 +593,14 @@ function cameraUpdate(dt, t) {
   const k = 1 - Math.exp(-dt * 3);
   cam.h += (cam.hT - cam.h) * (1 - Math.exp(-dt * 2.2));
   cam.dist += (cam.distT - cam.dist) * k;
+  if (driving()) {
+    let d = (boat.yaw - Math.PI / 2) - cam.yawT; d = Math.atan2(Math.sin(d), Math.cos(d));
+    cam.yawT += d * (1 - Math.exp(-dt * 1.3));
+  }
   cam.yaw += (cam.yawT - cam.yaw) * k;
-  cam.tx += (boat.x - cam.tx) * (1 - Math.exp(-dt * 1.5));
-  cam.tz += (boat.z - cam.tz) * (1 - Math.exp(-dt * 1.5));
+  const follow = 1 - Math.exp(-dt * (boat.spd > 0.3 ? 3.5 : 1.5));
+  cam.tx += (boat.x - cam.tx) * follow;
+  cam.tz += (boat.z - cam.tz) * follow;
   cam.ty += (boat.y - cam.ty) * (1 - Math.exp(-dt * 2));
   const px = cam.tx + Math.sin(cam.yaw) * cam.dist, pz = cam.tz + Math.cos(cam.yaw) * cam.dist;
   const near = 1 - smooth(0.25, 1.4, Math.abs(cam.h));          // ride the swell when the lens is low
@@ -605,6 +681,12 @@ function frame(now) {
     else if (avg < 0.0135 && scale < maxScale) { scale = Math.min(maxScale, scale * 1.07); resize(); }
   }
   const steps = 3; for (let i = 0; i < steps; i++) boatStep(T - dt + dt * (i + 1) / steps, dt / steps);
+  wakeStep(dt);
+  gl.uniform4fv(U.uWake, wake);
+  let wakeOn = 0; for (let i = 0; i < 20; i++) if (wake[i * 4 + 3] > 0 && T - wake[i * 4 + 2] < 4) wakeOn = 1;
+  gl.uniform1f(U.uWakeOn, wakeOn);
+  gl.uniform1f(U.uBoatSpd, Math.min(boat.spd / 2.5, 1.2));
+  gl.uniform1f(U.uSeed, sea.seed);
 
   const s = sunVec(), sc = sunColor(), lr = refractDown(s);
   gl.uniform2f(U.uRes, canvas.width, canvas.height);
